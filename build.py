@@ -424,87 +424,70 @@ class NinjaFile(object):
                         # HACK: this happens to be a good file to base the pch flags off of.
                         pchvars = dict(**build['variables'])
 
-                    pch_file = 'test-pch.h' if 'test' in build['inputs'][0] else 'pch.h'
-                    build.setdefault('implicit', []).append(pch_dir + pch_file + '.$pch_suffix')
-
                     if using_ccache:
                         # TODO look into ccache's sloppiness=pch_defines setting and see if it is
                         # safe for our uses. For now disable ccache on files using pch since ccache
                         # will refuse to cache them anyway.
                         build['variables']['CCACHE'] = ''
 
+                    pch_file = 'test-pch.h' if 'test' in build['inputs'][0] else 'pch.h'
                     if not self.globalEnv.ToolchainIs('msvc'):
                         # -include uses path to file
                         build['variables']['pch_flags'] = '-include ' + pch_dir + pch_file
+                        build.setdefault('implicit', []).append(pch_dir + pch_file + '.$pch_suffix')
                     else:
                         # /FI and friends use the same rules as #include
                         build['variables']['pch_flags'] = (
                                 '/Fp{0}{1}.$pch_suffix /Yumongo/{1} /FImongo/{1}'
                                     .format(pch_dir, pch_file))
+                        # Ninja only knows about the .obj file and uses that, not the .pch file, to
+                        # track header dependencies. This works around the ninja limitation that
+                        # rules using 'deps' can't have builds with multiple outputs.
+                        build.setdefault('implicit', []).append(pch_dir + pch_file + '.obj')
+
             elif build['rule'] == 'LINK' and self.globalEnv.ToolchainIs('msvc'):
-                # see below for why these aren't just normal sources and are added to the LINK
-                # command.
-                build.setdefault('implicit', []).extend([pch_dir+'pch.h.$pch_suffix',
-                                                         pch_dir+'test-pch.h.$pch_suffix'])
+                build.setdefault('inputs', []).extend([pch_dir+'pch.h.obj',
+                                                       pch_dir+'test-pch.h.obj'])
 
         self.vars['pch_flags'] = ''
         self.vars['pch_suffix'] = 'gch' if self.globalEnv.ToolchainIs('gcc') else 'pch'
 
-        # Copy the pch headers to the build dir so the compiled pch 
-        self.builds.append(dict(
-            rule='INSTALL',
-            inputs=sibling('pch.h'),
-            outputs=pch_dir + 'pch.h'))
-        self.builds.append(dict(
-            rule='INSTALL',
-            inputs=sibling('test-pch.h'),
-            outputs=pch_dir + 'test-pch.h'))
-
         if not self.globalEnv.ToolchainIs('msvc'):
+            # position matters on non-msvc compilers
             self.tool_commands['CXX'] = self.tool_commands['CXX'].replace('$out', '$out $pch_flags')
             pchvars['pch_flags']= '-x c++-header'
-            self.builds.append(dict(
-                rule='CXX',
-                inputs=pch_dir + 'pch.h',
-                outputs=pch_dir + 'pch.h.$pch_suffix',
-                order_only='_generated_headers',
-                variables=pchvars,
-                ))
-            self.builds.append(dict(
-                rule='CXX',
-                inputs=pch_dir + 'test-pch.h',
-                outputs=pch_dir + 'test-pch.h.$pch_suffix',
-                order_only='_generated_headers',
-                variables=pchvars,
-                ))
         else:
-            # This works around the ninja limitation that rules using 'deps' can't have builds with
-            # multiple outputs. That is why the CXXPCH builds don't list their .obj as an output and
-            # nothing else using it as an input. TODO consider using the .obj as the file ninja is
-            # aware of and the .pch file be the "ghost" file.
-            self.tool_commands['LINK'] += ' {0}pch.obj {0}test-pch.obj'.format(pch_dir)
-            self.tool_commands['CXXPCH'] = (self.tool_commands['CXX']
-                                                    .replace('$in', sibling('empty.cpp'))
-                                            + ' /Fp$out /Yc$in /FI$in /I.')
-
             self.tool_commands['CXX'] += ' $pch_flags'
 
-            pchvars['_MSVC_OUTPUT_FLAG'] = '/Fo%spch.obj'%pch_dir
+        for pch_file in ('pch.h', 'test-pch.h'):
+            # Copy the pch headers to the build dir so the compiled pch is there rather than in the
+            # source tree. They need to be in the same directory.
             self.builds.append(dict(
-                rule='CXXPCH',
-                inputs=pch_dir + 'pch.h',
-                outputs=pch_dir + 'pch.h.$pch_suffix',
-                order_only='_generated_headers',
-                variables=dict(**pchvars),
-                ))
-            pchvars['_MSVC_OUTPUT_FLAG'] = '/Fo%stest-pch.obj'%pch_dir
-            self.builds.append(dict(
-                rule='CXXPCH',
-                inputs=pch_dir + 'test-pch.h',
-                outputs=pch_dir + 'test-pch.h.$pch_suffix',
-                order_only='_generated_headers',
-                variables=dict(**pchvars),
-                ))
+                rule='INSTALL',
+                inputs=sibling(pch_file),
+                outputs=pch_dir + pch_file))
+
+            if not self.globalEnv.ToolchainIs('msvc'):
+                self.builds.append(dict(
+                    rule='CXX',
+                    inputs=pch_dir + pch_file,
+                    outputs=pch_dir + pch_file + '.$pch_suffix',
+                    order_only='_generated_headers',
+                    variables=pchvars,
+                    ))
+            else:
+                pchvars['_MSVC_OUTPUT_FLAG'] = '/Fo%s%s.obj'%(pch_dir, pch_file)
+                pchvars['pch_flags'] = '/Fp{0} /Yc{1} /FI{1}'.format(pch_dir + pch_file + '.pch',
+                                                                  'mongo/' + pch_file)
+                self.builds.append(dict(
+                    rule='CXX',
+                    inputs=pch_dir + pch_file,
+                    outputs=pch_dir + pch_file + '.obj',
+                    order_only='_generated_headers',
+                    variables=dict(pchvars), # copy it
+                    # can't have multiple outputs.
+                    #implicit_outputs=pch_dir + pch_file + '.pch', 
+                    ))
 
     def write(self):
         file = open(self.ninja_file, 'w')
@@ -623,11 +606,6 @@ class NinjaFile(object):
                     deps = 'msvc',
                     command = '%s /showIncludes'%(self.tool_commands['CXX']),
                     description = 'CXX $out')
-            if 'CXXPCH' in self.tool_commands:
-                ninja.rule('CXXPCH',
-                    deps = 'msvc',
-                    command = '%s /showIncludes'%(self.tool_commands['CXXPCH']),
-                    description = 'CXXPCH $out')
             if 'CC' in self.tool_commands:
                 ninja.rule('CC',
                     deps = 'msvc',
